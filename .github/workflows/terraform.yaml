@@ -1,53 +1,41 @@
-# update terraform yaml ....
-name: Terraform Infrastructure
+name: Terraform (AWS Emulator)
 
-# PR to main        → plan only
-# Push/merge to main → plan (auto) → approval gate → apply
-# Manual dispatch    → plan, apply, or destroy dev environment
+# Tests the Terraform code against AWS Emulator running on the GitHub runner.
+# No AWS account, no access keys, no cost: every run starts from an empty emulator,
+# runs init → validate → plan → apply → plan (must show no changes), then throws it away.
 
 on:
-  # Real-AWS pipeline: manual only until AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets exist.
-  # To re-enable automatic runs, restore the push/pull_request triggers below.
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'envs/dev/**'
-  #     - 'modules/**'
-  # pull_request:
-  #   branches: [main]
-  #   paths:
-  #     - 'envs/dev/**'
-  #     - 'modules/**'
+  push:
+    paths:
+      - 'envs/dev/**'
+      - 'modules/**'
+      - 'ci/**'
+      - '.github/workflows/terraform-emulator.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'envs/dev/**'
+      - 'modules/**'
+      - 'ci/**'
+      - '.github/workflows/terraform-emulator.yaml'
   workflow_dispatch:
-    inputs:
-      action:
-        description: 'Terraform action'
-        required: true
-        default: 'plan'
-        type: choice
-        options: [plan, apply, destroy]
-      confirm_destroy:
-        description: 'Type "destroy" to confirm destruction (required when action=destroy)'
-        required: false
-        default: ''
 
 permissions:
   contents: read
 
 env:
   TF_VERSION: '1.15.6'
-  AWS_REGION: us-east-1
+  EMULATOR_PORT: '9297'
 
-# Prevent parallel runs on the same branch — avoids state conflicts
 concurrency:
-  group: terraform-${{ github.ref }}
-  cancel-in-progress: false   # wait, don't cancel — safer for Terraform
+  group: terraform-emulator-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ── Plan ──────────────────────────────────────────────────────────────────
-  plan:
-    name: Terraform Plan
+  emulator-test:
+    name: Plan & Apply on AWS Emulator
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: envs/dev
@@ -59,145 +47,89 @@ jobs:
         uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false   # keep real exit codes for -detailed-exitcode
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+      - name: Install AWS Emulator (latest release)
+        run: |
+          deb=$(mktemp -d)/aws-emulator.deb
+          curl -fsSLo "$deb" https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+          sudo apt-get install -y "$deb"
+          /opt/aws-emulator/bin/aws-emulator -v
+
+      - name: Start AWS Emulator (telemetry off)
+        run: |
+          mkdir -p ~/.aws/emulator
+          nohup /opt/aws-emulator/bin/aws-emulator -p "$EMULATOR_PORT" -t off \
+            > ~/.aws/emulator/$EMULATOR_PORT.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf --cacert ~/.aws/emulator/$EMULATOR_PORT/ca.pem \
+              https://127.0.0.1:$EMULATOR_PORT/__admin/health && break
+            sleep 1
+          done
+          curl -sf --cacert ~/.aws/emulator/$EMULATOR_PORT/ca.pem \
+            https://127.0.0.1:$EMULATOR_PORT/__admin/health
+
+      - name: Point AWS CLI at the emulator
+        run: |
+          d=$HOME/.aws/emulator/$EMULATOR_PORT
+          {
+            echo "AWS_ENDPOINT_URL=https://127.0.0.1:$EMULATOR_PORT"
+            echo "AWS_SHARED_CREDENTIALS_FILE=$d/emulator_credentials"
+            echo "AWS_CONFIG_FILE=$d/config"
+            echo "AWS_CA_BUNDLE=$d/ca.pem"
+            echo "AWS_EC2_METADATA_DISABLED=true"
+            echo "AWS_REGION=us-east-1"
+            echo "AWS_DEFAULT_REGION=us-east-1"
+            echo "AWS_PAGER="
+          } >> "$GITHUB_ENV"
+
+      - name: Check we are talking to the emulator (account 000000000000)
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "Account: $account"
+          test "$account" = "000000000000"
+
+      - name: Prepare state bucket, override and test inputs
+        run: |
+          aws s3 mb s3://zen-pharma-terraform-state-ahmed
+          cp ../../ci/emulator_override.tf ./emulator_override.tf
+          # Throw-away values for this run only (the emulator is deleted when the job ends)
+          db_pw="ci$(openssl rand -hex 12)"; jwt="$(openssl rand -hex 24)"
+          echo "::add-mask::$db_pw"; echo "::add-mask::$jwt"
+          echo "TF_VAR_db_password=$db_pw" >> "$GITHUB_ENV"
+          echo "TF_VAR_jwt_secret=$jwt"    >> "$GITHUB_ENV"
 
       - name: Terraform Format Check
-        id: fmt
-        run: terraform fmt -check -recursive
+        run: terraform fmt -check -recursive ../..
         continue-on-error: true
 
       - name: Terraform Init
-        id: init
-        run: terraform init
+        run: terraform init -input=false -no-color
 
       - name: Terraform Validate
-        id: validate
         run: terraform validate -no-color
 
       - name: Terraform Plan
-        id: plan
-        run: |
-          terraform plan \
-            -var="db_password=${{ secrets.DEV_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.DEV_JWT_SECRET }}" \
-            -var="github_org=${{ vars.GH_ORG }}" \
-            -out=tfplan \
-            -no-color
-        continue-on-error: true
-
-      - name: Check plan status
-        if: steps.plan.outcome == 'failure'
-        run: exit 1
-
-      - name: Release state lock on failure
-        if: failure() || cancelled()
-        run: |
-          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/envs/dev/terraform.tfstate.tflock || true
-
-      - name: Upload plan file
-        if: steps.plan.outcome == 'success'
-        uses: actions/upload-artifact@v6
-        with:
-          name: tfplan
-          path: envs/dev/tfplan
-          retention-days: 1
-
-  # ── Apply ─────────────────────────────────────────────────────────────────
-  apply:
-    name: Terraform Apply
-    runs-on: ubuntu-latest
-    needs: plan
-    if: |
-      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
-    environment: dev   # ← pauses here and waits for manual approval
-    defaults:
-      run:
-        working-directory: envs/dev
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup Terraform ${{ env.TF_VERSION }}
-        uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Download plan file
-        uses: actions/download-artifact@v7
-        with:
-          name: tfplan
-          path: envs/dev
+        run: terraform plan -input=false -no-color -out=tfplan
 
       - name: Terraform Apply
+        run: terraform apply -input=false -no-color -auto-approve tfplan
+
+      - name: Re-plan must show no changes
+        run: terraform plan -input=false -no-color -detailed-exitcode
+
+      - name: Summary
+        if: always()
         run: |
-          terraform apply \
-            -auto-approve \
-            -no-color \
-            tfplan
+          {
+            echo "## Terraform on AWS Emulator"
+            echo "- Emulator: $(/opt/aws-emulator/bin/aws-emulator -v | head -1)"
+            echo "- Resources in state: $(terraform state list 2>/dev/null | wc -l)"
+            echo "- EKS clusters: $(aws eks list-clusters --query clusters --output text 2>/dev/null)"
+            echo "- RDS instances: $(aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,EngineVersion,DBInstanceStatus]' --output text 2>/dev/null)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Release state lock on failure
-        if: failure() || cancelled()
-        run: |
-          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/envs/dev/terraform.tfstate.tflock || true
+      - name: Show emulator log on failure
+        if: failure()
+        run: tail -n 100 ~/.aws/emulator/$EMULATOR_PORT.log || true
 
-  # ── Destroy ───────────────────────────────────────────────────────────────
-  destroy:
-    name: Terraform Destroy
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.action == 'destroy' &&
-      github.event.inputs.confirm_destroy == 'destroy'
-    environment: dev   # ← approval gate for destroy too
-    defaults:
-      run:
-        working-directory: envs/dev
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup Terraform ${{ env.TF_VERSION }}
-        uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Destroy
-        run: |
-          terraform destroy \
-            -var="db_password=${{ secrets.DEV_DB_PASSWORD }}" \
-            -var="jwt_secret=${{ secrets.DEV_JWT_SECRET }}" \
-            -var="github_org=${{ vars.GH_ORG }}" \
-            -auto-approve \
-            -no-color
-
-      - name: Release state lock on failure
-        if: failure() || cancelled()
-        run: |
-          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/envs/dev/terraform.tfstate.tflock || true
