@@ -21,6 +21,7 @@ crash.*.log
 override.tf
 override.tf.json
 *_override.tf
+!ci/emulator_override.tf
 *_override.tf.json
 
 # Terraform CLI config
