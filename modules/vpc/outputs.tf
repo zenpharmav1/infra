@@ -21,3 +21,9 @@ output "public_subnet_ids" {
     description = "The IDs of the public subnets"
     value       = module.vpc.public_subnets
 }
+
+# database subnet group output (used by the rds module)
+output "database_subnet_group_name" {
+    description = "The name of the database subnet group"
+    value       = module.vpc.database_subnet_group_name
+}
